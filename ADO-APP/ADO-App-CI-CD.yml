@@ -1,0 +1,188 @@
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+    - release/*
+    - bugfix/*
+    - hotfix/*
+    - feature/*
+
+pool:
+  name: agentShiva
+
+stages:
+  - stage: BuildAndPublishAPP
+    displayName: 'Build and Publish Application'
+    jobs:
+      - job: BUILDANDPUBLISH
+        steps:
+          - task: UseDotNet@2
+            displayName: 'Download .NET SDK'
+            inputs:
+              packageType: 'sdk'
+              version: '6.0.x'
+          - task: PowerShell@2
+            displayName: 'Validate Commit Message'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $commit_message = git log -1 --pretty=format:%s
+                $pattern = '.*ADO-Commit-Message-Check-[0-9]+.*'
+                if ($commit_message -match $pattern) {
+                  Write-Host "Commit message is valid."
+                } else {
+                  Write-Error "Invalid commit message format."
+                  Write-Host "$commit_message"
+                  Write-Host "Commit message does not match the required format 'ADO-HOMETASK-SHIVA-**** your comment'."
+                  exit 1
+                }
+          - task: PowerShell@2
+            name: buildNumber
+            displayName: 'Update Build Number and Set Old Build Number'
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "##vso[task.setvariable variable=oldBuildNumber;isOutput=true]$(Build.BuildNumber)"
+                $date = Get-Date -Format "yyyy.MM.dd"
+                echo "##vso[build.updatebuildnumber]Infra-CI-CD-$date.$(Build.BuildID)"
+          - task: DotNetCoreCLI@2
+            displayName: 'Building App'
+            inputs:
+              command: 'build'
+              projects: '**/*.csproj'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'                 
+          - task: DotNetCoreCLI@2
+            displayName: 'Publishing App'
+            inputs:
+              command: 'publish'
+              publishWebProjects: false
+              projects: '**/*.csproj'
+              arguments: '-o $(Build.ArtifactStagingDirectory)/publishedApp'
+              zipAfterPublish: true
+              modifyOutputPath: true              
+          - task: PowerShell@2
+            displayName: 'Migrating SQL'
+            inputs:
+              targetType: 'inline'
+              script: |
+                dotnet tool install --global dotnet-ef --version 6.*
+                dotnet ef migrations script -p "$(System.DefaultWorkingDirectory)/DotNetCoreSqlDb/DotNetCoreSqlDb.csproj" -o "$(Build.ArtifactStagingDirectory)/migration/migration@$(Build.BuildID).sql" -i
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish App Artifact'
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)/publishedApp"
+              ArtifactName: 'publishedApp@$(buildNumber.oldBuildNumber)'
+              publishLocation: 'Container'
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish SQL Artifact'
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)/migration"
+              ArtifactName: 'publishedSQL@$(buildNumber.oldBuildNumber)'
+              publishLocation: 'Container'
+
+  - stage: DeployApp
+    displayName: 'Deploy Application'
+    condition: and(succeeded('BuildAndPublishAPP'), or(eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')))
+    dependsOn: BuildAndPublishAPP
+    pool:
+      name: agentShiva
+    variables:
+      - group: AppResourcesDetails
+      - group: PRODEnvironmentVariables
+      - name: oldBuildNumber
+        value: $[stageDependencies.BuildAndPublishAPP.BUILDANDPUBLISH.outputs['buildNumber.oldBuildNumber']]
+    jobs:
+      - deployment: DeployToStaging
+        environment:
+          name: DEPLOY
+        displayName: 'Preproduction Deployment Slot'
+        strategy:
+          runOnce:
+            deploy:
+              steps:            
+                - task: DownloadBuildArtifacts@1
+                  displayName: 'Acquire Application Build Artifact'
+                  inputs:
+                    buildType: 'current'
+                    downloadType: 'single'
+                    artifactName: 'publishedApp@$(oldBuildNumber)'
+                    downloadPath: '$(System.DefaultWorkingDirectory)'
+                - task: DownloadBuildArtifacts@1
+                  displayName: 'Retrieve SQL Build Artifact'
+                  inputs:
+                    buildType: 'current'
+                    downloadType: 'single'
+                    artifactName: 'publishedSQL@$(oldBuildNumber)'
+                    downloadPath: '$(System.DefaultWorkingDirectory)'
+                - task: AzureCLI@2
+                  displayName: 'Adjust App Parameters with Azure CLI'
+                  inputs:
+                    azureSubscription: 'devops'
+                    scriptType: 'ps'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az webapp config appsettings set --resource-group $(resource_group_name) --name $(webapp_name) --settings ASPNETCORE_ENVIRONMENT=$(ASPNETCORE_ENVIRONMENT)
+                
+                - task: AzurePowerShell@5
+                  displayName: 'Add Firewall Rule for Azure SQL if not exists'
+                  inputs:
+                    azureSubscription: 'devops'
+                    ScriptType: 'InlineScript'
+                    Inline: |
+                      $firewallRule = Get-AzSqlServerFirewallRule -ResourceGroupName $(resource_group_name) -ServerName $(server_app_name) -FirewallRuleName "AllowPipelineIP" -ErrorAction SilentlyContinue
+                      if ($firewallRule -eq $null) {
+                        New-AzSqlServerFirewallRule -ResourceGroupName $(resource_group_name) -ServerName $(server_app_name) -FirewallRuleName "AllowPipelineIP" -StartIpAddress "0.0.0.0" -EndIpAddress "255.255.255.255"
+                        Write-Host "Firewall rule 'AllowPipelineIP' created."
+                      }
+                      else {
+                        Write-Host "Firewall rule 'AllowPipelineIP' already exists."
+                      }
+                    azurePowershellVersion: 'LatestVersion'
+
+                - task: AzurePowerShell@5
+                  displayName: 'Execute SQL Migration Script'
+                  inputs:
+                    azureSubscription: 'devops'
+                    ScriptType: 'InlineScript'
+                    Inline: |
+                      Install-Module -Name SqlServer -Scope CurrentUser -Force -AllowClobber
+                      Import-Module -Name SqlServer
+                      $sqlScript = Get-Content -Path "$(System.DefaultWorkingDirectory)/publishedSQL@$(oldBuildNumber)/migration@$(Build.BuildID).sql" -Raw
+                      Invoke-Sqlcmd -ServerInstance "$(server_name)" -Database "$(database_name)" -Username "$(SQL_SERVER_ADMINISTRATOR_LOGIN)" -Password "$(SQL_SERVER_ADMINISTRATOR_PASSWORD)" -Query $sqlScript
+                    azurePowershellVersion: 'LatestVersion'
+                - task: AzureWebApp@1
+                  displayName: 'Staging Deployment Pipeline'
+                  inputs:
+                    azureSubscription: 'devops'
+                    appType: 'webApp'
+                    appName: '$(webapp_name)'
+                    deployToSlotOrASE: true
+                    resourceGroupName: '$(resource_group_name)'
+                    slotName: '$(stagging_app)'
+                    package: '$(System.DefaultWorkingDirectory)/**/*.zip'
+                    deploymentMethod: 'auto'
+
+  - stage: SwapSlot
+    displayName: 'Slot Transition Mechanism'
+    condition: and(succeeded('DeployApp'),  eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    dependsOn: DeployApp
+    variables:
+      - group: AppResourcesDetails
+    jobs:
+      - deployment: 'Swapimg_stagging_to_prod'
+        environment:
+          name: DEPLOY
+        displayName: 'Preproduction Deployment Slot'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureAppServiceManage@0
+                  displayName: 'Swapping Slot'
+                  inputs:
+                    azureSubscription: 'devops'
+                    Action: 'Swap Slots'
+                    WebAppName: '$(webapp_name)'
+                    ResourceGroupName: '$(resource_group_name)'
+                    SourceSlot: '$(stagging_app)'

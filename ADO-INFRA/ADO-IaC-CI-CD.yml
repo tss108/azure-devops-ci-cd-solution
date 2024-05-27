@@ -1,0 +1,566 @@
+trigger:
+  branches:
+    include:
+    - master
+    - develop
+    - release/*
+    - bugfix/*
+    - hotfix/*
+    - feature/*
+pool:
+  name: agentShiva
+stages:
+- stage: ValidateAndPublishBuild
+  displayName: 'Build and Publish'
+  variables:
+  - group: TerraformVersion
+  - group: buildStageVariables
+  jobs:
+  - job: validateAndBuild
+    displayName: ValidateTerraform
+    continueOnError: false
+    steps:
+    - task: PowerShell@2
+      displayName: 'Validate Commit Message'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $commit_message = git log -1 --pretty=format:%s
+          $pattern = '.*ADO-Commit-Message-Check-[0-9]+.*'
+          if ($commit_message -match $pattern) {
+            Write-Host "Commit message is valid."
+          } else {
+            Write-Error "Invalid commit message format."
+            Write-Host "$commit_message"
+            Write-Host "Commit message does not match the required format 'ADO-HOMETASK-SHIVA-**** your comment'."
+            exit 1
+          }
+    - task: PowerShell@2
+      name: buildNumber
+      displayName: 'Update Build Number and Set Old Build Number'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "##vso[task.setvariable variable=oldBuildNumber;isOutput=true]$(Build.BuildNumber)"
+          $date = Get-Date -Format "yyyy.MM.dd"
+          echo "##vso[build.updatebuildnumber]Infra-CI-CD-$date.$(Build.BuildID)"
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: $(version)
+    - task: TerraformTaskV4@4
+      displayName: 'Unit Test: Format'
+      inputs:
+        provider: 'azurerm'
+        command: 'custom'
+        customCommand: 'fmt'
+        outputTo: 'console'
+        environmentServiceNameAzureRM: 'devops'
+    - task: TerraformTaskV2@2
+      displayName: 'Initialization'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        backendServiceArm: 'devops'
+        backendAzureRmResourceGroupName: $(backed_resource_group_name)
+        backendAzureRmStorageAccountName: $(backend_storage_account_name)
+        backendAzureRmContainerName: $(backend_container_name)
+        backendAzureRmKey: $(backend_key)
+    - task: TerraformTaskV2@2
+      displayName: 'Unit test: Validate'
+      inputs:
+        provider: 'azurerm'
+        command: 'validate'
+  - job: ArchiveAndPublish
+    dependsOn:
+    - validateAndBuild
+    displayName: 'Archive and Publish'
+    continueOnError: false
+    variables:
+    - name: oldBuildNumber
+      value: $[ dependencies.validateAndBuild.outputs['buildNumber.oldBuildNumber'] ]
+    steps:
+    - task: CopyFiles@2
+      displayName: 'Staging Preparation'
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)'
+        Contents: |
+          **.tfvars
+          **.tf
+        TargetFolder: '$(Build.ArtifactStagingDirectory)/artifactFiles'
+    - task: ArchiveFiles@2
+      displayName: 'Archive Build Artifacts'
+      inputs:
+        rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/artifactFiles'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: "$(Build.artifactstagingdirectory)/iac.terraform.$(oldBuildNumber).zip"
+        replaceExistingArchive: true
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish Terraform Configuration"
+      inputs:
+        PathtoPublish: "$(Build.artifactstagingdirectory)/iac.terraform.$(oldBuildNumber).zip"
+        ArtifactName: 'buildtfArtifact@$(Build.BuildID)'
+        publishLocation: 'Container'
+- stage: DEVPlan
+  condition: succeeded('ValidateAndPublishBuild')
+  dependsOn:
+  - ValidateAndPublishBuild
+  variables:
+  - group: TerraformVersion
+  - group: DEVEnvironmentVariables
+  - name: oldBuildNumber
+    value: $[stageDependencies.ValidateAndPublishBuild.validateAndBuild.outputs['buildNumber.oldBuildNumber']]
+  jobs:
+  - job: DevStructure
+    displayName: 'Plan Validation'
+    continueOnError: false
+    steps:
+    - task: DownloadBuildArtifacts@1
+      displayName: "Download Terraform Configuration"
+      inputs:
+        ArtifactName: 'buildtfArtifact@$(Build.BuildID)'
+        buildType: 'current'
+        downloadPath: '$(System.DefaultWorkingDirectory)/Artifacts/zippedArtifacts'
+    - task: ExtractFiles@1
+      displayName: "Extract Terraform Configuration"
+      inputs:
+        archiveFilePatterns: '**/*.zip'
+        destinationFolder: '$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)'
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: $(version)
+    - task: TerraformTaskV2@2
+      displayName: 'Initialization'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        commandOptions: '-upgrade'
+        backendServiceArm: 'devops'
+        backendAzureRmResourceGroupName: $(backed_resource_group_name)
+        backendAzureRmStorageAccountName: $(backend_storage_account_name)
+        backendAzureRmContainerName: $(backend_container_name)
+        backendAzureRmKey: '$(environment).$(backend_key)'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)'
+    - task: TerraformTaskV2@2
+      displayName: "Execution Plan"
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        commandOptions: >
+          -input=false -var "app_version=$(app_version)" -var "ENV=$(environment)" -var "LOCATION=$(location)" -var "RESOURCE_NAME_PREFIX=$(resource_name_prefix)" -var "SQL_SERVER_ADMINISTRATOR_LOGIN=$(SQL_SERVER_ADMINISTRATOR_LOGIN)" -var "SQL_SERVER_ADMINISTRATOR_PASSWORD=$(SQL_SERVER_ADMINISTRATOR_PASSWORD)" -out=devtfplan@$(Build.BuildID)
+        environmentServiceNameAzureRM: 'devops'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)'
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish Terraform Plan"
+      inputs:
+        PathtoPublish: "$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)/devtfplan@$(Build.BuildID)"
+        ArtifactName: 'devtfPlanArtifact@$(Build.BuildID)'
+        publishLocation: 'Container'
+- stage: DEVApply
+  condition: and(succeeded('DEVPlan'), or(eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.SourceBranch'], 'refs/heads/master'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')))
+  dependsOn:
+  - DEVPlan
+  variables:
+  - group: TerraformVersion
+  - group: DEVEnvironmentVariables
+  - name: oldBuildNumber
+    value: $[stageDependencies.ValidateAndPublishBuild.validateAndBuild.outputs['buildNumber.oldBuildNumber']]
+  jobs:
+  - deployment: DevDeployment
+    environment:
+      name: DEV
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Terraform Configuration"
+            inputs:
+              ArtifactName: 'buildtfArtifact@$(Build.BuildID)'
+              buildType: 'current'
+              downloadPath: '$(System.DefaultWorkingDirectory)/Artifacts/zippedArtifacts'
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Planned Artifact"
+            inputs:
+              ArtifactName: 'devtfPlanArtifact@$(Build.BuildID)'
+              buildType: 'current'
+              downloadPath: '$(System.DefaultWorkingDirectory)/Artifacts'
+          - task: ExtractFiles@1
+            displayName: "Extract Terraform Configuration"
+            inputs:
+              archiveFilePatterns: '**/*.zip'
+              destinationFolder: '$(System.DefaultWorkingDirectory)/Artifacts/devtfPlanArtifact@$(Build.BuildID)'
+              cleanDestinationFolder: false
+          - task: TerraformInstaller@0
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: $(version)
+          - task: TerraformTaskV2@2
+            displayName: 'Initialization'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              commandOptions: '-upgrade'
+              backendServiceArm: 'devops'
+              backendAzureRmResourceGroupName: $(backed_resource_group_name)
+              backendAzureRmStorageAccountName: $(backend_storage_account_name)
+              backendAzureRmContainerName: $(backend_container_name)
+              backendAzureRmKey: '$(environment).$(backend_key)'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/devtfPlanArtifact@$(Build.BuildID)'
+          - task: TerraformTaskV2@2
+            displayName: "Deployment Execution"
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              commandOptions: "devtfplan@$(Build.BuildID)"
+              environmentServiceNameAzureRM: 'devops'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/devtfPlanArtifact@$(Build.BuildID)'
+- stage: QAPlan
+  condition: succeeded('ValidateAndPublishBuild')
+  dependsOn:
+  - ValidateAndPublishBuild
+  variables:
+  - group: TerraformVersion
+  - group: QAEnvironmentVariables
+  - name: oldBuildNumber
+    value: $[stageDependencies.ValidateAndPublishBuild.validateAndBuild.outputs['buildNumber.oldBuildNumber']]
+  jobs:
+  - job: QaStructure
+    displayName: 'Plan Validation'
+    continueOnError: false
+    steps:
+    - task: DownloadBuildArtifacts@1
+      displayName: "Download Terraform Configuration"
+      inputs:
+        ArtifactName: 'buildtfArtifact@$(Build.BuildID)'
+        buildType: 'current'
+        downloadPath: '$(System.DefaultWorkingDirectory)/Artifacts/zippedArtifacts'
+    - task: ExtractFiles@1
+      displayName: "Extract Terraform Configuration"
+      inputs:
+        archiveFilePatterns: '**/*.zip'
+        destinationFolder: '$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)'
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: $(version)
+    - task: TerraformTaskV2@2
+      displayName: 'Initialization'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        commandOptions: '-upgrade'
+        backendServiceArm: 'devops'
+        backendAzureRmResourceGroupName: $(backed_resource_group_name)
+        backendAzureRmStorageAccountName: $(backend_storage_account_name)
+        backendAzureRmContainerName: $(backend_container_name)
+        backendAzureRmKey: '$(environment).$(backend_key)'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)'
+    - task: TerraformTaskV2@2
+      displayName: "Execution Plan"
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        commandOptions: >
+          -input=false -var "app_version=$(app_version)" -var "ENV=$(environment)" -var "LOCATION=$(location)" -var "RESOURCE_NAME_PREFIX=$(resource_name_prefix)" -var "SQL_SERVER_ADMINISTRATOR_LOGIN=$(SQL_SERVER_ADMINISTRATOR_LOGIN)" -var "SQL_SERVER_ADMINISTRATOR_PASSWORD=$(SQL_SERVER_ADMINISTRATOR_PASSWORD)" -out=qatfplan@$(Build.BuildID)
+        environmentServiceNameAzureRM: 'devops'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)'
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish Terraform Plan"
+      inputs:
+        PathtoPublish: "$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)/qatfplan@$(Build.BuildID)"
+        ArtifactName: 'qatfPlanArtifact@$(Build.BuildID)'
+        publishLocation: 'Container'
+- stage: QAApply
+  condition: and(succeeded('QAPlan'), or(eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.SourceBranch'], 'refs/heads/master'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')))
+  dependsOn:
+  - QAPlan
+  variables:
+  - group: TerraformVersion
+  - group: QAEnvironmentVariables
+  - name: oldBuildNumber
+    value: $[stageDependencies.ValidateAndPublishBuild.validateAndBuild.outputs['buildNumber.oldBuildNumber']]
+  jobs:
+  - deployment: QaDeployment
+    environment:
+      name: QA
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Terraform Configuration"
+            inputs:
+              ArtifactName: 'buildtfArtifact@$(Build.BuildID)'
+              buildType: 'current'
+              downloadPath: '$(System.DefaultWorkingDirectory)/Artifacts/zippedArtifacts'
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Planned Artifact"
+            inputs:
+              ArtifactName: 'qatfPlanArtifact@$(Build.BuildID)'
+              buildType: 'current'
+              downloadPath: '$(System.DefaultWorkingDirectory)/Artifacts'
+          - task: ExtractFiles@1
+            displayName: "Extract Terraform Configuration"
+            inputs:
+              archiveFilePatterns: '**/*.zip'
+              destinationFolder: '$(System.DefaultWorkingDirectory)/Artifacts/qatfPlanArtifact@$(Build.BuildID)'
+              cleanDestinationFolder: false
+          - task: TerraformInstaller@0
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: $(version)
+          - task: TerraformTaskV2@2
+            displayName: 'Initialization'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              commandOptions: '-upgrade'
+              backendServiceArm: 'devops'
+              backendAzureRmResourceGroupName: $(backed_resource_group_name)
+              backendAzureRmStorageAccountName: $(backend_storage_account_name)
+              backendAzureRmContainerName: $(backend_container_name)
+              backendAzureRmKey: '$(environment).$(backend_key)'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/qatfPlanArtifact@$(Build.BuildID)'
+          - task: TerraformTaskV2@2
+            displayName: "Deployment Execution"
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              commandOptions: "qatfplan@$(Build.BuildID)"
+              environmentServiceNameAzureRM: 'devops'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/qatfPlanArtifact@$(Build.BuildID)'
+- stage: UATPlan
+  condition: and(succeeded('DEVApply'), succeeded('QAApply'))
+  dependsOn:
+  - DEVApply
+  - QAApply
+  variables:
+  - group: TerraformVersion
+  - group: UATEnvironmentVariables
+  - name: oldBuildNumber
+    value: $[stageDependencies.ValidateAndPublishBuild.validateAndBuild.outputs['buildNumber.oldBuildNumber']]
+  jobs:
+  - job: UATStructure
+    displayName: 'Plan Validation'
+    continueOnError: false
+    steps:
+    - task: DownloadBuildArtifacts@1
+      displayName: "Download Terraform Configuration"
+      inputs:
+        ArtifactName: 'buildtfArtifact@$(Build.BuildID)'
+        buildType: 'current'
+        downloadPath: '$(System.DefaultWorkingDirectory)/Artifacts/zippedArtifacts'
+    - task: ExtractFiles@1
+      displayName: "Extract Terraform Configuration"
+      inputs:
+        archiveFilePatterns: '**/*.zip'
+        destinationFolder: '$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)'
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: $(version)
+    - task: TerraformTaskV2@2
+      displayName: 'Initialization'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        commandOptions: '-upgrade'
+        backendServiceArm: 'devops'
+        backendAzureRmResourceGroupName: $(backed_resource_group_name)
+        backendAzureRmStorageAccountName: $(backend_storage_account_name)
+        backendAzureRmContainerName: $(backend_container_name)
+        backendAzureRmKey: '$(environment).$(backend_key)'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)'
+    - task: TerraformTaskV2@2
+      displayName: "Execution Plan"
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        commandOptions: >
+          -input=false -var "app_version=$(app_version)" -var "ENV=$(environment)" -var "LOCATION=$(location)" -var "RESOURCE_NAME_PREFIX=$(resource_name_prefix)" -var "SQL_SERVER_ADMINISTRATOR_LOGIN=$(SQL_SERVER_ADMINISTRATOR_LOGIN)" -var "SQL_SERVER_ADMINISTRATOR_PASSWORD=$(SQL_SERVER_ADMINISTRATOR_PASSWORD)" -out=uattfplan@$(Build.BuildID)
+        environmentServiceNameAzureRM: 'devops'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)'
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish Terraform Plan"
+      inputs:
+        PathtoPublish: "$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)/uattfplan@$(Build.BuildID)"
+        ArtifactName: 'uattfPlanArtifact@$(Build.BuildID)'
+        publishLocation: 'Container'
+- stage: UATApply
+  condition: and(succeeded('UATPlan'), or(eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.SourceBranch'], 'refs/heads/master'), startsWith(variables['Build.SourceBranch'], 'refs/heads/release/')))
+  dependsOn:
+  - UATPlan
+  variables:
+  - group: TerraformVersion
+  - group: UATEnvironmentVariables
+  - name: oldBuildNumber
+    value: $[stageDependencies.ValidateAndPublishBuild.validateAndBuild.outputs['buildNumber.oldBuildNumber']]
+  jobs:
+  - deployment: UatDeployment
+    environment:
+      name: UAT
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Terraform Configuration"
+            inputs:
+              ArtifactName: 'buildtfArtifact@$(Build.BuildID)'
+              buildType: 'current'
+              downloadPath: '$(System.DefaultWorkingDirectory)/Artifacts/zippedArtifacts'
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Planned Artifact"
+            inputs:
+              ArtifactName: 'uattfPlanArtifact@$(Build.BuildID)'
+              buildType: 'current'
+              downloadPath: '$(System.DefaultWorkingDirectory)/Artifacts'
+          - task: ExtractFiles@1
+            displayName: "Extract Terraform Configuration"
+            inputs:
+              archiveFilePatterns: '**/*.zip'
+              destinationFolder: '$(System.DefaultWorkingDirectory)/Artifacts/uattfPlanArtifact@$(Build.BuildID)'
+              cleanDestinationFolder: false
+          - task: TerraformInstaller@0
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: $(version)
+          - task: TerraformTaskV2@2
+            displayName: 'Initialization'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              commandOptions: '-upgrade'
+              backendServiceArm: 'devops'
+              backendAzureRmResourceGroupName: $(backed_resource_group_name)
+              backendAzureRmStorageAccountName: $(backend_storage_account_name)
+              backendAzureRmContainerName: $(backend_container_name)
+              backendAzureRmKey: '$(environment).$(backend_key)'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/uattfPlanArtifact@$(Build.BuildID)'
+          - task: TerraformTaskV2@2
+            displayName: "Deployment Execution"
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              commandOptions: "uattfplan@$(Build.BuildID)"
+              environmentServiceNameAzureRM: 'devops'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/uattfPlanArtifact@$(Build.BuildID)'
+- stage: PRODPlan
+  condition: succeeded('UATApply')
+  dependsOn:
+  - UATApply
+  variables:
+  - group: TerraformVersion
+  - group: PRODEnvironmentVariables
+  - name: oldBuildNumber
+    value: $[stageDependencies.ValidateAndPublishBuild.validateAndBuild.outputs['buildNumber.oldBuildNumber']]
+  jobs:
+  - job: ProdStructure
+    displayName: 'Plan Validation'
+    continueOnError: false
+    steps:
+    - task: DownloadBuildArtifacts@1
+      displayName: "Download Terraform Configuration"
+      inputs:
+        ArtifactName: 'buildtfArtifact@$(Build.BuildID)'
+        buildType: 'current'
+        downloadPath: '$(System.DefaultWorkingDirectory)/Artifacts/zippedArtifacts'
+    - task: ExtractFiles@1
+      displayName: "Extract Terraform Configuration"
+      inputs:
+        archiveFilePatterns: '**/*.zip'
+        destinationFolder: '$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)'
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: $(version)
+    - task: TerraformTaskV2@2
+      displayName: 'Initialization'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        commandOptions: '-upgrade'
+        backendServiceArm: 'devops'
+        backendAzureRmResourceGroupName: $(backed_resource_group_name)
+        backendAzureRmStorageAccountName: $(backend_storage_account_name)
+        backendAzureRmContainerName: $(backend_container_name)
+        backendAzureRmKey: '$(environment).$(backend_key)'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)'
+    - task: TerraformTaskV2@2
+      displayName: "Execution Plan"
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        commandOptions: >
+          -input=false -var "app_version=$(app_version)" -var "ENV=$(environment)" -var "LOCATION=$(location)" -var "RESOURCE_NAME_PREFIX=$(resource_name_prefix)" -var "SQL_SERVER_ADMINISTRATOR_LOGIN=$(SQL_SERVER_ADMINISTRATOR_LOGIN)" -var "SQL_SERVER_ADMINISTRATOR_PASSWORD=$(SQL_SERVER_ADMINISTRATOR_PASSWORD)" -out=prodtfplan@$(Build.BuildID)
+        environmentServiceNameAzureRM: 'devops'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)'
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish Terraform Plan"
+      inputs:
+        PathtoPublish: "$(System.DefaultWorkingDirectory)/Artifacts/iac.terraform.$(oldBuildNumber)/prodtfplan@$(Build.BuildID)"
+        ArtifactName: 'prodtfPlanArtifact@$(Build.BuildID)'
+        publishLocation: 'Container'
+- stage: PRODApply
+  condition: and(succeeded('PRODPlan'), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+  dependsOn:
+  - PRODPlan
+  variables:
+  - group: TerraformVersion
+  - group: PRODEnvironmentVariables
+  - name: oldBuildNumber
+    value: $[stageDependencies.ValidateAndPublishBuild.validateAndBuild.outputs['buildNumber.oldBuildNumber']]
+  jobs:
+  - deployment: ProdDeployment
+    environment:
+      name: PROD
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Terraform Configuration"
+            inputs:
+              ArtifactName: 'buildtfArtifact@$(Build.BuildID)'
+              buildType: 'current'
+              downloadPath: '$(System.DefaultWorkingDirectory)/Artifacts/zippedArtifacts'
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Planned Artifact"
+            inputs:
+              ArtifactName: 'prodtfPlanArtifact@$(Build.BuildID)'
+              buildType: 'current'
+              downloadPath: '$(System.DefaultWorkingDirectory)/Artifacts'
+          - task: ExtractFiles@1
+            displayName: "Extract Terraform Configuration"
+            inputs:
+              archiveFilePatterns: '**/*.zip'
+              destinationFolder: '$(System.DefaultWorkingDirectory)/Artifacts/prodtfPlanArtifact@$(Build.BuildID)'
+              cleanDestinationFolder: false
+          - task: TerraformInstaller@0
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: $(version)
+          - task: TerraformTaskV2@2
+            displayName: 'Initialization'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              commandOptions: '-upgrade'
+              backendServiceArm: 'devops'
+              backendAzureRmResourceGroupName: $(backed_resource_group_name)
+              backendAzureRmStorageAccountName: $(backend_storage_account_name)
+              backendAzureRmContainerName: $(backend_container_name)
+              backendAzureRmKey: '$(environment).$(backend_key)'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/prodtfPlanArtifact@$(Build.BuildID)'
+          - task: TerraformTaskV2@2
+            displayName: "Deployment Execution"
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              commandOptions: "prodtfplan@$(Build.BuildID)"
+              environmentServiceNameAzureRM: 'devops'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Artifacts/prodtfPlanArtifact@$(Build.BuildID)'
+
